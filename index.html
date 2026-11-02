@@ -173,47 +173,66 @@ let toastT;
 function toast(msg){ const t=$('#toast'); t.textContent=msg; t.classList.add('on'); clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove('on'),2200); }
 function dlabel(s){ const d=parseD(s); return `${d.getMonth()+1}/${d.getDate()}(${DOW[d.getDay()]})`; }
 
-/* ---------- 신원 ---------- */
-let UID = ls.get('mb_uid'); if (!UID) { UID = rid(12); ls.set('mb_uid', UID); }
+/* ---------- 신원 (방마다 따로 저장) ---------- */
+const ROOM = new URLSearchParams(location.search).get('r') || '';
+let UID = ls.get('mb_uid'); if (!UID) { UID = rid(12); ls.set('mb_uid', UID); }   // 새로 가입할 때 쓰는 기본 신원
 let NICK = ls.get('mb_nick') || '';
+let TOKEN = '';
+function loadId(room){ try { return JSON.parse(ls.get('mb_id_' + room) || 'null'); } catch(e){ return null; } }
+function saveId(room, id){ ls.set('mb_id_' + room, JSON.stringify(id)); ls.set('mb_nick', id.nick); }
+function applyId(id){ UID = id.uid; NICK = id.nick; TOKEN = id.token; }
 
 /* ---------- 백엔드 (실서버 / 데모) ---------- */
 const DEMO = !API_URL;
+const demoDB = () => JSON.parse(ls.get('mb_demo') || '[]');
+const demoKick = room => JSON.parse(ls.get('mb_demo_kick_' + room) || '[]');
 const backend = DEMO ? {
+  async login(b){ return { ok:true, uid:b.uid, token:'demo', nick:b.nick }; },
   async pull(room, since){
-    const all = JSON.parse(ls.get('mb_demo') || '[]');
-    return { ok:true, last: all.length ? all[all.length-1].n : 1, ai:false, rows: all.filter(e => e.room===room && e.n>since) };
+    const all = demoDB(), kicked = demoKick(room);
+    if (kicked.includes(UID)) return { ok:true, kicked:true, rows:[], last:1 };
+    return { ok:true, last: all.length ? all[all.length-1].n : 1, ai:false, kv:kicked.join(','), rows: all.filter(e => e.room===room && e.n>since && !kicked.includes(e.uid)) };
   },
   async add(ev){
-    const all = JSON.parse(ls.get('mb_demo') || '[]');
+    const all = demoDB();
     if (all.some(e => e.cid===ev.cid)) return {ok:true};
     const n = (all.length ? all[all.length-1].n : 1) + 1;
     all.push({ n, room:ev.room, type:ev.type, uid:ev.uid, nick:ev.nick, payload:ev.payload, ts:Date.now(), cid:ev.cid });
     ls.set('mb_demo', JSON.stringify(all));
     return {ok:true, n};
   },
+  async adminList(){
+    const seen = {}; demoDB().filter(e => e.room===ROOM && e.nick).forEach(e => seen[e.uid] = e.nick);
+    const kicked = demoKick(ROOM);
+    return { ok:true, host:UID, members:Object.keys(seen).map(u => ({ uid:u, nick:seen[u], kicked:kicked.includes(u) })) };
+  },
+  async kick(b){
+    let k = demoKick(ROOM).filter(u => u !== b.target); if (b.on !== false) k.push(b.target);
+    ls.set('mb_demo_kick_' + ROOM, JSON.stringify(k)); return { ok:true };
+  },
   async summarize(){ return {ok:false, error:'no_key'}; }
-} : {
-  async pull(room, since){
-    const r = await fetch(`${API_URL}?action=pull&room=${encodeURIComponent(room)}&since=${since}&uid=${encodeURIComponent(UID)}&_=${Date.now()}`);
+} : (() => {
+  const post = async body => {
+    const r = await fetch(API_URL, { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify(body) });
     return r.json();
-  },
-  async add(ev){
-    const r = await fetch(API_URL, { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify({action:'add', ...ev}) });
-    return r.json();
-  },
-  async summarize(body){
-    const r = await fetch(API_URL, { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify({action:'summarize', ...body}) });
-    return r.json();
-  }
-};
+  };
+  return {
+    login: b => post({ action:'login', ...b }),
+    pull: (room, since) => post({ action:'pull', room, since, uid:UID, token:TOKEN, kv:lastKv }),
+    add: ev => post({ action:'add', ...ev, token:TOKEN }),
+    adminList: () => post({ action:'admin_list', room:ROOM, uid:UID, token:TOKEN }),
+    kick: b => post({ action:'kick', room:ROOM, uid:UID, token:TOKEN, ...b }),
+    summarize: b => post({ action:'summarize', ...b, token:TOKEN })
+  };
+})();
 
 /* ---------- 상태 ---------- */
-const ROOM = new URLSearchParams(location.search).get('r') || '';
 let server = [];            // 서버에서 받은 이벤트
 let pending = [];           // 아직 서버 반영 확인 전인 내 이벤트
 let serverCids = new Set();
 let lastN = 1;
+let lastKv = '';
+let kickedOut = false;
 let aiOn = false;
 let online = true;
 let loaded = false;
@@ -266,12 +285,14 @@ function reasonsOf(target, dir){
 /* ---------- 전송 / 폴링 ---------- */
 let flushing = false;
 function send(type, payload){
+  if (kickedOut) return null;
   const ev = { cid: rid(14), room: ROOM, type, uid: UID, nick: NICK, payload, ts: Date.now() };
   pending.push(ev);
   render();
   flush();
   return ev;
 }
+const FATAL = ['forbidden','exists','too_long','bad_type','bad_room'];
 async function flush(){
   if (flushing) return;
   flushing = true;
@@ -282,6 +303,9 @@ async function flush(){
         try {
           const r = await backend.add({ room:ev.room, type:ev.type, uid:ev.uid, nick:ev.nick, payload:ev.payload, cid:ev.cid });
           if (r && r.ok){ ev.sent = true; setOnline(true); break; }
+          if (r && r.error === 'auth'){ pending = pending.filter(p => p !== ev); needLogin(); break; }
+          if (r && r.error === 'kicked'){ pending = []; showKicked(); break; }
+          if (r && FATAL.includes(r.error)){ pending = pending.filter(p => p !== ev); toast('저장하지 못했어요 (' + r.error + ')'); render(); break; }
           throw new Error(r && r.error || 'fail');
         } catch(err){
           setOnline(false);
@@ -289,50 +313,126 @@ async function flush(){
           await new Promise(res => setTimeout(res, 2500));
         }
       }
+      if (kickedOut) break;
     }
   } finally { flushing = false; }
   poll();
 }
 function setOnline(v){ online = v; const d=$('#stat'); if (d){ d.className = 'dot ' + (v ? 'ok' : 'bad'); d.nextSibling.textContent = v ? '실시간 연결됨' : '연결 확인 중…'; } }
+function resetData(){ server = []; serverCids = new Set(); lastN = 1; lastKv = ''; loaded = false; }
 
 let polling = false;
 async function poll(){
-  if (polling || !ROOM) return;
+  if (polling || !ROOM || kickedOut || loginOpen) return;
   polling = true;
   try {
     const r = await backend.pull(ROOM, lastN);
-    if (r && r.ok){
+    if (r && r.ok === false && r.error === 'auth'){ needLogin(); }
+    else if (r && r.ok){
       setOnline(true);
-      aiOn = !!r.ai;
-      let changed = !loaded;
-      for (const e of r.rows){
-        if (serverCids.has(e.cid) && e.cid) continue;
-        server.push(e); if (e.cid) serverCids.add(e.cid); changed = true;
+      if (r.kicked){ showKicked(); }
+      else {
+        aiOn = !!r.ai;
+        if (r.reset){ server = []; serverCids = new Set(); }
+        if (r.kv != null) lastKv = r.kv;
+        let changed = !loaded || !!r.reset;
+        for (const e of r.rows){
+          if (serverCids.has(e.cid) && e.cid) continue;
+          server.push(e); if (e.cid) serverCids.add(e.cid); changed = true;
+        }
+        server.sort((a,b) => a.n - b.n);
+        lastN = r.reset ? (r.last || 1) : Math.max(lastN, r.last || lastN);
+        const before = pending.length;
+        pending = pending.filter(p => !(p.sent && serverCids.has(p.cid)));
+        loaded = true;
+        if (changed || before !== pending.length) render();
+        maybeAuto();
       }
-      server.sort((a,b) => a.n - b.n);
-      lastN = Math.max(lastN, r.last || lastN);
-      const before = pending.length;
-      pending = pending.filter(p => !(p.sent && serverCids.has(p.cid)));
-      loaded = true;
-      if (changed || before !== pending.length) render();
-      maybeAuto();
     }
   } catch(err){ setOnline(false); }
   polling = false;
 }
 function loop(){
+  if (kickedOut) return;
   if (!document.hidden) poll();
   setTimeout(loop, POLL_MS);
 }
 document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
 
 /* ---------- 화면 뼈대 ---------- */
+let loginOpen = false;
+const LOGIN_ERR = {
+  wrong_pin:'비밀번호가 맞지 않아요.',
+  name_taken:'이미 다른 사람이 쓰고 있는 이름이에요. 처음 쓰던 브라우저가 아니라면 다른 이름을 써 주세요.',
+  locked:'비밀번호를 여러 번 틀려서 10분간 잠겼어요. 잠시 후 다시 시도해 주세요.',
+  kicked:'이 방에서 제외된 이름이에요.',
+  bad_pin:'비밀번호는 4~12자로 입력해 주세요.',
+  bad_nick:'대화명을 입력해 주세요.',
+  full:'더 이상 등록할 수 없어요.'
+};
+// 대화명+비밀번호로 로그인(처음이면 가입). 성공하면 방별 신원을 저장한다.
+async function doLogin(room, nick, pin){
+  const r = await backend.login({ room, nick, pin, uid:UID });
+  if (r && r.ok){
+    const id = { uid:r.uid, token:r.token, nick:r.nick || nick };
+    saveId(room, id); applyId(id);
+    return { ok:true, id };
+  }
+  return { ok:false, msg: LOGIN_ERR[r && r.error] || '로그인하지 못했어요. 잠시 후 다시 시도해 주세요.' };
+}
+function askLogin({ rename = false } = {}){
+  return new Promise(resolve => {
+    loginOpen = true;
+    const ov = document.createElement('div'); ov.className = 'ov';
+    ov.innerHTML = `<div class="modal"><h2>${rename ? '대화명 변경' : '대화명과 비밀번호'}</h2>
+      <p class="muted" style="margin:0 0 6px">${rename
+        ? '새 대화명과 비밀번호를 정하면, 지금까지의 내 기록이 새 이름으로 이어져요.'
+        : '처음이면 새로 만들어지고, 이미 쓰던 이름이면 같은 비밀번호로 이어서 쓸 수 있어요. 다른 기기·브라우저에서도 같은 이름과 비밀번호로 들어오면 이전 기록이 그대로 이어져요.'}</p>
+      <label class="muted">대화명</label>
+      <input id="ln1" maxlength="12" placeholder="예) 김주무관" value="${esc(rename ? '' : NICK)}" autocomplete="off">
+      <label class="muted">비밀번호 (4~12자)</label>
+      <input id="lp1" type="password" maxlength="12" placeholder="임시 번호 (평소 쓰는 비밀번호는 쓰지 마세요)" autocomplete="off">
+      <div id="lmsg" style="color:var(--no);font-size:13px;min-height:18px;margin-bottom:6px"></div>
+      <div class="mb">${rename ? '<button class="btn" id="lno">닫기</button>' : ''}<button class="btn pri" id="lok" style="${rename ? '' : 'width:100%;padding:10px'}">${rename ? '변경' : '입장'}</button></div></div>`;
+    document.body.appendChild(ov);
+    const close = v => { loginOpen = false; ov.remove(); resolve(v); };
+    const go = async () => {
+      const nick = $('#ln1').value.trim(), pin = $('#lp1').value;
+      if (!nick) { $('#lmsg').textContent = LOGIN_ERR.bad_nick; return; }
+      if (pin.length < 4) { $('#lmsg').textContent = LOGIN_ERR.bad_pin; return; }
+      $('#lok').disabled = true; $('#lmsg').textContent = '';
+      try {
+        const r = await doLogin(ROOM, nick, pin);
+        if (r.ok) close(r.id); else { $('#lmsg').textContent = r.msg; $('#lok').disabled = false; }
+      } catch(err){ $('#lmsg').textContent = '서버에 연결하지 못했어요. 잠시 후 다시 시도해 주세요.'; $('#lok').disabled = false; }
+    };
+    $('#lok').onclick = go;
+    $('#lp1').onkeydown = $('#ln1').onkeydown = e => { if (e.key==='Enter') go(); };
+    if (rename) $('#lno').onclick = () => close(null);
+    setTimeout(() => { const el = $(NICK && !rename ? '#lp1' : '#ln1'); el && el.focus(); }, 50);
+  });
+}
+// 저장된 신원이 서버에서 거부된 경우(토큰 불일치 등): 다시 로그인
+async function needLogin(){
+  if (loginOpen || kickedOut) return;
+  try { localStorage.removeItem('mb_id_' + ROOM); } catch(e){}
+  const id = await askLogin();
+  if (id){ resetData(); pending = []; poll(); }
+}
+function showKicked(){
+  if (kickedOut) return;
+  kickedOut = true; pending = [];
+  const ov = document.createElement('div'); ov.className = 'ov';
+  ov.innerHTML = '<div class="modal"><h2>이 방에서 제외되었어요</h2><p class="muted">방장이 이 이름을 제외했어요. 문의가 필요하면 방장에게 연락해 주세요.</p></div>';
+  document.body.appendChild(ov);
+}
+
 function mountLanding(){
   const t = new Date(); const e = new Date(); e.setDate(e.getDate()+41);
   $('#app').innerHTML = `
   <div class="land card">
     <h1>회의 조율 보드 만들기</h1>
-    <p class="muted">일정·장소·안건을 한 링크에서 함께 정리해요. 만들고 나면 링크를 참석자에게 보내면 됩니다.</p>
+    <p class="muted">일정·장소·안건을 한 링크에서 함께 정리해요. 만들고 나면 링크를 참석자에게 보내면 됩니다. 만든 사람이 방장(관리자)이 돼요.</p>
     ${DEMO ? '<div class="demo">데모 모드: 이 브라우저에서만 저장돼요. 실제로 쓰려면 index.html 상단의 API_URL 에 Apps Script 주소를 넣어 주세요.</div>' : ''}
     <label>회의 이름</label>
     <input id="lt" maxlength="60" placeholder="예) 12월 업무협의회">
@@ -340,35 +440,30 @@ function mountLanding(){
       <div><label>후보 시작일</label><input id="ls" type="date" value="${fmt(t)}"></div>
       <div><label>후보 종료일</label><input id="le" type="date" value="${fmt(e)}"></div>
     </div>
-    <label>내 대화명</label>
-    <input id="ln" maxlength="12" placeholder="예) 김주무관" value="${esc(NICK)}">
+    <div class="row2">
+      <div><label>내 대화명</label><input id="ln" maxlength="12" placeholder="예) 김주무관" value="${esc(NICK)}" autocomplete="off"></div>
+      <div><label>비밀번호 (4~12자)</label><input id="lp" type="password" maxlength="12" placeholder="방장 확인용" autocomplete="off"></div>
+    </div>
+    <p class="muted" style="margin:-4px 0 10px">이 대화명+비밀번호로 어느 기기에서든 방장으로 들어와 관리 메뉴를 쓸 수 있어요. 평소 쓰는 비밀번호 말고 임시 번호를 쓰세요.</p>
     <button class="btn pri" id="mk" style="width:100%;padding:11px">보드 만들기</button>
   </div>`;
   $('#mk').onclick = async () => {
-    const title = $('#lt').value.trim(), s = $('#ls').value, e = $('#le').value, nick = $('#ln').value.trim();
+    const title = $('#lt').value.trim(), s = $('#ls').value, e = $('#le').value, nick = $('#ln').value.trim(), pin = $('#lp').value;
     if (!title) return toast('회의 이름을 적어 주세요');
     if (!nick) return toast('대화명을 적어 주세요');
+    if (pin.length < 4) return toast('비밀번호는 4~12자로 입력해 주세요');
     if (!s || !e || e < s) return toast('후보 기간을 확인해 주세요');
     if ((parseD(e) - parseD(s)) / 864e5 > 120) return toast('후보 기간은 최대 120일까지예요');
-    NICK = nick; ls.set('mb_nick', NICK);
     const id = rid(8);
     $('#mk').disabled = true;
     try {
+      const lg = await doLogin(id, nick, pin);
+      if (!lg.ok) throw new Error(lg.msg);
       const r = await backend.add({ room:id, type:'room', uid:UID, nick:NICK, payload:{ title, start:s, end:e }, cid: rid(14) });
-      if (!r || !r.ok) throw 0;
+      if (!r || !r.ok) throw new Error('add');
       location.search = '?r=' + id;
     } catch(err){ $('#mk').disabled = false; toast('만들지 못했어요. 주소 설정을 확인해 주세요.'); }
   };
-}
-
-function askNick(cb){
-  const ov = document.createElement('div'); ov.className = 'ov';
-  ov.innerHTML = `<div class="modal"><h2>대화명을 입력해 주세요</h2><p class="muted">일정 응답·투표·채팅에 표시돼요. 나중에 바꿀 수 있어요.</p>
-    <input id="nn" maxlength="12" placeholder="예) 김주무관" value="${esc(NICK)}"><button class="btn pri" id="nok" style="width:100%;padding:10px">입장</button></div>`;
-  document.body.appendChild(ov);
-  const go = () => { const v = $('#nn').value.trim(); if (!v) return; NICK = v; ls.set('mb_nick', v); ov.remove(); cb(); };
-  $('#nok').onclick = go; $('#nn').onkeydown = e => { if (e.key==='Enter') go(); };
-  setTimeout(() => { const el = $('#nn'); el && el.focus(); }, 50);
 }
 
 function mountMain(){
@@ -381,6 +476,7 @@ function mountMain(){
       <div class="chips" id="who"></div>
     </div>
     <div class="btns">
+      <button class="btn hide" id="adminbtn">⚙ 관리</button>
       <button class="btn" id="rename">대화명 변경</button>
       <button class="btn pri" id="share">링크 복사</button>
     </div>
@@ -416,19 +512,6 @@ function mountMain(){
         <h2>회의 요약</h2>
         <div id="sumhint" class="muted" style="margin-bottom:8px"></div>
         <div id="sumout"></div>
-        <details id="hostbox" class="hide">
-          <summary class="muted">방장 도구 (방을 만든 사람에게만 보여요)</summary>
-          <div style="display:flex;gap:6px;flex-wrap:wrap;margin:10px 0">
-            <button class="btn pri" id="aisum">✨ 지금 요약 갱신</button>
-            <button class="btn" id="cpsum">요약용 텍스트 복사</button>
-            <a class="btn" href="https://claude.ai/new" target="_blank" rel="noopener" style="text-decoration:none">Claude 열기 ↗</a>
-          </div>
-          <div class="muted" style="margin-bottom:4px">Claude에서 정리한 결과를 직접 올릴 수도 있어요 (모든 참석자에게 보여요)</div>
-          <textarea id="manual" style="min-height:90px" placeholder="요약 내용을 붙여넣기"></textarea>
-          <div style="margin:6px 0"><button class="btn" id="postsum">요약으로 올리기</button></div>
-          <div class="muted">요약에 넘어가는 원문</div>
-          <textarea id="rawtxt" readonly></textarea>
-        </details>
       </section>
     </div>
     <aside class="panel card chatcol" id="chatPanel" data-p="chat">
@@ -440,7 +523,13 @@ function mountMain(){
 
   document.querySelectorAll('.tab').forEach(b => b.onclick = () => setTab(b.dataset.t));
   $('#share').onclick = copyLink;
-  $('#rename').onclick = () => askNick(() => { send('chat', { text:'' }); toast('대화명이 바뀌었어요'); });
+  $('#adminbtn').onclick = openAdmin;
+  $('#rename').onclick = async () => {
+    const prev = UID, id = await askLogin({ rename:true });
+    if (!id) return;
+    if (id.uid !== prev){ resetData(); poll(); } else { send('chat', { text:'' }); }
+    toast('대화명이 바뀌었어요');
+  };
   $('#padd').onclick = addPlace;
   $('#pn').onkeydown = e => { if (e.key==='Enter') addPlace(); };
   $('#aadd').onclick = addAgenda;
@@ -450,12 +539,6 @@ function mountMain(){
   $('#cal').onclick = onCalClick;
   $('#places').onclick = onPlaceClick;
   $('#agenda').onclick = onListClick;
-  $('#aisum').onclick = makeAISummary;
-  $('#cpsum').onclick = () => copyText(summaryPayload());
-  $('#postsum').onclick = () => {
-    const v = $('#manual').value.trim(); if (!v) return toast('올릴 요약을 붙여넣어 주세요');
-    send('summary', { text:v.slice(0,9000) }); $('#manual').value = ''; toast('요약을 올렸어요');
-  };
   setOnline(true);
 }
 
@@ -560,6 +643,7 @@ function render(){
   $('#title').textContent = S.room.title;
   document.title = S.room.title + ' · 회의 조율 보드';
   $('#range').textContent = `후보 ${dlabel(S.room.start)} ~ ${dlabel(S.room.end)}`;
+  $('#adminbtn').classList.toggle('hide', S.hostUid !== UID);
   renderWho(); renderCal(); renderPlaces(); renderAgenda(); renderChat(); renderUnread();
   if (curTab==='sum') renderSummary();
 }
@@ -741,12 +825,7 @@ function mdLite(t){
   return out;
 }
 function renderSummary(){
-  const host = S.hostUid === UID, s = S.summary;
-  $('#hostbox').classList.toggle('hide', !host);
-  if (host){
-    $('#rawtxt').value = SUM_PROMPT + '\n\n' + summaryPayload();
-    $('#aisum').classList.toggle('hide', !aiOn);
-  }
+  const s = S.summary;
   $('#sumhint').textContent = s
     ? (aiOn ? '대화·투표 등 활동이 잠시 멈추면 자동으로 다시 정리돼요.' : '')
     : (aiOn ? '아직 요약이 없어요. 활동이 어느 정도 쌓이고 잠시 멈추면 자동으로 정리돼요.' : '아직 요약이 없어요. 방장이 정리해서 올리면 여기에 표시돼요.');
@@ -784,11 +863,74 @@ async function maybeAuto(){
   autoBusy = false;
 }
 
+/* ---------- 관리 (방장 전용) ---------- */
+async function openAdmin(){
+  if (S.hostUid !== UID) return;
+  const ov = document.createElement('div'); ov.className = 'ov';
+  ov.innerHTML = `<div class="modal" style="max-width:520px;max-height:88vh;overflow:auto">
+    <div style="display:flex;justify-content:space-between;align-items:center"><h2 style="margin:0">⚙ 관리 (방장)</h2><button class="btn sm" id="adx">닫기</button></div>
+    <h2 style="margin-top:14px">참가자</h2>
+    <div id="adlist" class="muted">불러오는 중…</div>
+    <h2 style="margin-top:16px">요약 도구</h2>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
+      <button class="btn pri ${aiOn ? '' : 'hide'}" id="aisum">✨ 지금 요약 갱신</button>
+      <button class="btn" id="cpsum">요약용 텍스트 복사</button>
+      <a class="btn" href="https://claude.ai/new" target="_blank" rel="noopener" style="text-decoration:none">Claude 열기 ↗</a>
+    </div>
+    <div class="muted" style="margin-bottom:4px">Claude에서 정리한 결과를 직접 올리면 모든 참석자에게 보여요.</div>
+    <textarea id="manual" style="min-height:80px;margin:0 0 6px" placeholder="요약 내용을 붙여넣기"></textarea>
+    <button class="btn" id="postsum">요약으로 올리기</button>
+    <details><summary class="muted">요약에 넘어가는 원문</summary><textarea id="rawtxt" readonly></textarea></details>
+  </div>`;
+  document.body.appendChild(ov);
+  const close = () => ov.remove();
+  $('#adx').onclick = close;
+  ov.addEventListener('click', e => { if (e.target === ov) close(); });
+  $('#rawtxt').value = SUM_PROMPT + '\n\n' + summaryPayload();
+  $('#aisum').onclick = makeAISummary;
+  $('#cpsum').onclick = () => copyText(SUM_PROMPT + '\n\n' + summaryPayload());
+  $('#postsum').onclick = () => {
+    const v = $('#manual').value.trim(); if (!v) return toast('올릴 요약을 붙여넣어 주세요');
+    send('summary', { text:v.slice(0,9000) }); $('#manual').value = ''; toast('요약을 올렸어요');
+  };
+
+  const armed = {};
+  async function loadList(){
+    let r;
+    try { r = await backend.adminList(); } catch(err){ r = null; }
+    const box = $('#adlist'); if (!box) return;
+    if (!r || !r.ok){ box.textContent = '참가자 목록을 불러오지 못했어요.'; return; }
+    box.className = '';
+    box.innerHTML = r.members.map(m => {
+      const me = m.uid === UID, host = m.uid === r.host;
+      const tag = host ? '<span class="chip me">방장</span>' : (m.kicked ? '<span class="chip" style="background:var(--no-soft);color:var(--no)">제외됨</span>' : (m.legacy ? '<span class="chip">로그인 전 기록</span>' : ''));
+      const btn = host ? '' : (m.kicked
+        ? `<button class="btn sm" data-a="restore" data-u="${esc(m.uid)}">복원</button>`
+        : `<button class="btn sm" data-a="kick" data-u="${esc(m.uid)}" style="color:var(--no)">${armed[m.uid] ? '한 번 더 누르면 내보내요' : '내보내기'}</button>`);
+      return `<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--line)"><div style="flex:1;min-width:0;word-break:break-all">${esc(m.nick)}${me ? ' <span class="muted">(나)</span>' : ''} ${tag}</div>${btn}</div>`;
+    }).join('') || '<div class="muted">참가자가 없어요.</div>';
+  }
+  $('#adlist').onclick = async e => {
+    const b = e.target.closest('button[data-a]'); if (!b) return;
+    const u = b.dataset.u;
+    if (b.dataset.a === 'kick' && !armed[u]){ armed[u] = true; loadList(); setTimeout(() => { delete armed[u]; loadList(); }, 3500); return; }
+    b.disabled = true;
+    const r = await backend.kick({ target:u, on: b.dataset.a === 'kick' });
+    delete armed[u];
+    if (r && r.ok){ toast(b.dataset.a === 'kick' ? '내보냈어요' : '복원했어요'); resetData(); poll(); }
+    else toast('처리하지 못했어요');
+    loadList();
+  };
+  loadList();
+}
+
 /* ---------- 시작 ---------- */
 (function init(){
   if (!ROOM){ mountLanding(); return; }
   const start = () => { mountMain(); poll().then(() => { render(); }); loop(); };
-  if (!NICK) askNick(start); else start();
+  const id = loadId(ROOM);
+  if (id){ applyId(id); start(); }
+  else askLogin().then(start);
 })();
 </script>
 </body>
