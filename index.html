@@ -251,6 +251,12 @@ function derive(){
     if (e.type !== 'summary' && e.type !== 'room' && !(e.type==='chat' && !p.text)) st.lastAct = Math.max(st.lastAct, e.ts || 0);
     switch (e.type){
       case 'room': if (!st.room){ st.room = p; st.hostUid = uid; } break;
+      case 'roomedit': if (st.room && uid === st.hostUid){            // 방장만 회의 설정 수정 가능
+        const q = {};
+        if (p.title) q.title = String(p.title).slice(0, 60);
+        if (/^\d{4}-\d{2}-\d{2}$/.test(p.start || '') && /^\d{4}-\d{2}-\d{2}$/.test(p.end || '') && p.end >= p.start) { q.start = p.start; q.end = p.end; }
+        st.room = { ...st.room, ...q };
+      } break;
       case 'avail': st.avail[uid] = p.days || {}; break;
       case 'place': st.places[p.id] = { ...p, uid, n:e.n }; break;
       case 'agenda': st.agenda[p.id] = { ...p, uid, n:e.n }; break;
@@ -389,7 +395,8 @@ function askLogin({ rename = false } = {}){
         ? '새 대화명과 비밀번호를 정하면, 지금까지의 내 기록이 새 이름으로 이어져요.'
         : '처음이면 새로 만들어지고, 이미 쓰던 이름이면 같은 비밀번호로 이어서 쓸 수 있어요. 다른 기기·브라우저에서도 같은 이름과 비밀번호로 들어오면 이전 기록이 그대로 이어져요.'}</p>
       <label class="muted">대화명</label>
-      <input id="ln1" maxlength="12" placeholder="예) 김주무관" value="${esc(rename ? '' : NICK)}" autocomplete="off">
+      <input id="ln1" maxlength="16" placeholder="예) 홍길동(서울)" value="${esc(rename ? '' : NICK)}" autocomplete="off">
+      <div class="muted" style="margin:-6px 0 8px;font-size:12px">대화명은 <b>이름(지역)</b> 형식으로 입력해 주세요. 예) 홍길동(서울)</div>
       <label class="muted">비밀번호 (4~12자)</label>
       <input id="lp1" type="password" maxlength="12" placeholder="임시 번호 (평소 쓰는 비밀번호는 쓰지 마세요)" autocomplete="off">
       <div id="lmsg" style="color:var(--no);font-size:13px;min-height:18px;margin-bottom:6px"></div>
@@ -441,7 +448,7 @@ function mountLanding(){
       <div><label>후보 종료일</label><input id="le" type="date" value="${fmt(e)}"></div>
     </div>
     <div class="row2">
-      <div><label>내 대화명</label><input id="ln" maxlength="12" placeholder="예) 김주무관" value="${esc(NICK)}" autocomplete="off"></div>
+      <div><label>내 대화명 · 이름(지역)</label><input id="ln" maxlength="16" placeholder="예) 홍길동(서울)" value="${esc(NICK)}" autocomplete="off"></div>
       <div><label>비밀번호 (4~12자)</label><input id="lp" type="password" maxlength="12" placeholder="방장 확인용" autocomplete="off"></div>
     </div>
     <p class="muted" style="margin:-4px 0 10px">이 대화명+비밀번호로 어느 기기에서든 방장으로 들어와 관리 메뉴를 쓸 수 있어요. 평소 쓰는 비밀번호 말고 임시 번호를 쓰세요.</p>
@@ -869,7 +876,16 @@ async function openAdmin(){
   const ov = document.createElement('div'); ov.className = 'ov';
   ov.innerHTML = `<div class="modal" style="max-width:520px;max-height:88vh;overflow:auto">
     <div style="display:flex;justify-content:space-between;align-items:center"><h2 style="margin:0">⚙ 관리 (방장)</h2><button class="btn sm" id="adx">닫기</button></div>
-    <h2 style="margin-top:14px">참가자</h2>
+    <h2 style="margin-top:14px">회의 설정</h2>
+    <label class="muted">회의 이름</label>
+    <input id="ed-t" maxlength="60" value="${esc(S.room.title)}" style="width:100%;border:1px solid var(--line);border-radius:9px;padding:8px 10px;margin:2px 0 8px">
+    <div class="row2">
+      <div><label class="muted">후보 시작일</label><input id="ed-s" type="date" value="${esc(S.room.start)}" style="width:100%;border:1px solid var(--line);border-radius:9px;padding:8px 10px;margin:2px 0 8px"></div>
+      <div><label class="muted">후보 종료일</label><input id="ed-e" type="date" value="${esc(S.room.end)}" style="width:100%;border:1px solid var(--line);border-radius:9px;padding:8px 10px;margin:2px 0 8px"></div>
+    </div>
+    <div class="muted" style="margin-bottom:6px">기간을 바꿔도 이미 낸 응답은 그대로 남아요. 새 범위 밖 날짜는 달력에서만 가려져요.</div>
+    <button class="btn pri" id="ed-save">설정 저장</button>
+    <h2 style="margin-top:16px">참가자</h2>
     <div id="adlist" class="muted">불러오는 중…</div>
     <h2 style="margin-top:16px">요약 도구</h2>
     <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
@@ -887,6 +903,14 @@ async function openAdmin(){
   $('#adx').onclick = close;
   ov.addEventListener('click', e => { if (e.target === ov) close(); });
   $('#rawtxt').value = SUM_PROMPT + '\n\n' + summaryPayload();
+  $('#ed-save').onclick = () => {
+    const title = $('#ed-t').value.trim(), s = $('#ed-s').value, e = $('#ed-e').value;
+    if (!title) return toast('회의 이름을 적어 주세요');
+    if (!s || !e || e < s) return toast('후보 기간을 확인해 주세요');
+    if ((parseD(e) - parseD(s)) / 864e5 > 120) return toast('후보 기간은 최대 120일까지예요');
+    send('roomedit', { title, start:s, end:e });
+    toast('회의 설정을 저장했어요');
+  };
   $('#aisum').onclick = makeAISummary;
   $('#cpsum').onclick = () => copyText(SUM_PROMPT + '\n\n' + summaryPayload());
   $('#postsum').onclick = () => {

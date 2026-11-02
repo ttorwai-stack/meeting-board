@@ -15,7 +15,7 @@ const EVENTS = 'events';
 const MEMBERS = 'members';
 const E_HEADER = ['room', 'type', 'uid', 'nick', 'payload', 'ts', 'cid'];
 const M_HEADER = ['room', 'key', 'nick', 'hash', 'uid', 'token', 'kicked', 'ts'];
-const TYPES = ['room', 'avail', 'place', 'agenda', 'vote', 'del', 'chat', 'summary'];
+const TYPES = ['room', 'roomedit', 'avail', 'place', 'agenda', 'vote', 'del', 'chat', 'summary'];
 const MAX_PAYLOAD = 12000;
 const DAILY_SUMMARY_CAP = 150;   // 하루 요약 최대 횟수(API 비용 보호)
 const MAX_MEMBERS = 5000;
@@ -227,7 +227,7 @@ function pull_(room, since, uid, token, kv) {
 function login_(b) {
   const room = String(b.room || '');
   if (!roomOk_(room)) return { ok: false, error: 'bad_room' };
-  const nick = clean_(b.nick, 12);
+  const nick = clean_(b.nick, 16);
   const pin = String(b.pin == null ? '' : b.pin);
   const uid = clean_(b.uid, 40);
   if (!nick) return { ok: false, error: 'bad_nick' };
@@ -306,7 +306,7 @@ function add_(b) {
   if (me.kicked) return { ok: false, error: 'kicked' };
 
   if (b.type === 'room' && hostOf_(room)) return { ok: false, error: 'exists' };
-  if (b.type === 'summary' && hostOf_(room) !== uid) return { ok: false, error: 'forbidden' };
+  if ((b.type === 'summary' || b.type === 'roomedit') && hostOf_(room) !== uid) return { ok: false, error: 'forbidden' };   // 요약 올리기·회의 설정 수정은 방장만
 
   return append_(room, b.type, uid, b.nick, b.payload, clean_(b.cid, 40));
 }
